@@ -1,0 +1,133 @@
+---
+title: "Code PS IPTW binary variable"
+author: "Jeanne LECLERE"
+date: today 
+format: html
+editor: visual
+warning: FALSE
+message: FALSE
+---
+
+### Packages
+
+```{r}
+library("dplyr")
+library("tidyverse")
+library("ggplot2")
+```
+
+## Data formatting and creation of a binary variable
+
+```{r}
+#Opening file
+data <- read.csv("donnees_synthetiques.csv", header = TRUE, sep=",") 
+
+#Visualization of distriubtion exciting variable
+str(data$SEMSA)
+hist(data$SEMSA_seuil)
+```
+
+### Calculation of logistic regression of the HLQ score function of covariates for the propensity score
+
+The score is calculated using binary logistic regression because the HLQ variable is transformed into a binary variable. It corresponds to the conditional probability (y) of exposure, weighted by the presence of the covariates (x) (defined by DAG).
+
+Here, the chosen covariates are age, gender, and BMI, for example.
+
+```{r}
+#Calculation of the propensity score by logistic regression 
+ps_model <- glm(SEMSA_seuil ~ AGE + GENDER + BODY.MASS.INDEX + APNEA.HYPOPNEA.INDEX,
+                data = data,
+                family = binomial)
+coefs <- coef(ps_model)
+summary(ps_model)
+```
+
+We observe that increasing age increases the odds ratio (OR): exp(0.024) = 1.024. The older the age, the higher the probability of having a better HLQ score.
+
+For gender, the OR = exp(-0.318) = 0.7 (1 being coded for males). Men have a lower probability of having a low HLQ score.
+
+For BMI, the OR exp(0.011) = 1.011. The probability of having a better HLQ score increases with weight.
+
+We obtain the logit(BMI) equation = β0 + β1*AGE + β2*GENDER + β3\*BMI (β0 = intercept), from which we calculate the propensity score of each individual added to the database :
+
+PS = e\^logit / (1+e\^(logit))
+
+### Calculating the propensity score
+
+```{r}
+#Calculation of the propensity score = Probability per each individual 
+logit <- coefs["(Intercept)"] + coefs["AGE"] * data$AGE + coefs["GENDER"] * data$GENDER + coefs["BODY.MASS.INDEX"] * data$BODY.MASS.INDEX + coefs["APNEA.HYPOPNEA.INDEX"] * data$APNEA.HYPOPNEA.INDEX
+#Propensity score
+PS <- exp(logit) / (1 + exp(logit))
+head(PS)
+
+#Adding the score to the data
+data$propensity_score <- PS
+```
+
+### Verification of the distribution of propensity scores in the population
+
+```{r}
+#Verification of the distribution of propensity scores
+summary(data$propensity_score)
+
+#Visualisation 
+data %>%
+  ggplot(aes(x = propensity_score, fill = as.factor(SEMSA_seuil))) +
+  geom_density(position = "identity",
+                 alpha = 0.5) +
+  scale_fill_manual(values = c("purple", "yellow"))
+```
+
+### Calculation of IPTW weighting
+
+The IPTW weighting is calculated from the propensity score and corresponds to the inverse of the propensity score.
+
+If HLQ = 1 alors IPTW = 1/PS and if HLQ =0 then,IPTW = 1/(1-PS)
+
+```{r}
+#Calculation of frequency to calculate stabilized weights
+proba_exposure <- sum(data$SEMSA_seuil == 1) / nrow(data)
+
+#Calculation of IPTW : inverse of the propensity score according to HLQ_moy_bin ><1
+data <- data %>%
+  mutate(iptw = case_when(
+  SEMSA_seuil == 1 ~ proba_exposure/data$propensity_score,
+  SEMSA_seuil == 0 ~ (1-proba_exposure)/(1-data$propensity_score)
+  ))
+
+#Round the weight values to integers
+head(data$iptw)
+hist(data$iptw)
+```
+
+### Verification of the distribution of IPTW scores in the population
+
+```{r}
+#Verification of weight distribution 
+summary(data$iptw)
+
+#Visualisation
+data %>%
+  ggplot(aes(x = iptw, fill = as.factor(SEMSA_seuil))) +
+  geom_density(position = "identity",
+               alpha = 0.5) +
+  scale_fill_manual(values = c("purple", "yellow"))
+```
+
+### Estimation of the estimand
+
+Here, the estimand is the ATE due to the use of the IPTW. It answers the research question: what is the adjusted effect of the covariates (age, gender, BMI) on the probability of treatment adherence function of the HLQ score?
+
+We use binary regression to estimate treatment adherence (y = final outcome) function of the SEMSA score, based on the previously calculated weights.
+
+```{r}
+##ogistic regression with new weights to estimate the effect of the HLQ score on binary variable adherence
+fit <- glm(obs_J365_1M_PPC ~ SEMSA_seuil, 
+           data = data,
+           family = gaussian(),
+           weights = iptw)
+summary(fit)
+```
+
+Here the p-value is \< 0.05 which shows that the model is statistically significant for predicting treatment adherence from the binary SEMSA_seuil. Patients with SEMSA_seuil = 1 got exp(07882) = 2.2 more odds to be adherent to treatment.

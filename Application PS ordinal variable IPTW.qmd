@@ -1,0 +1,230 @@
+---
+title: "Code PS IPTW ordinal variable"
+author: "Jeanne LECLERE"
+date: today 
+format: html
+editor: visual
+warning: FALSE
+message: FALSE
+---
+
+### Packages
+
+```{r}
+library("dplyr")
+library("tidyverse")
+library("ordinal")
+library('ggplot2')
+library('cobalt')
+library('gtsummary')
+library('brant')
+```
+
+## Data formatting and creation of an ordinal variable
+
+```{r}
+#Opening file
+data <- read.csv("donnees_synthetiques.csv", header = TRUE, sep=",") 
+
+#Search for values corresponding to percentiles to create categories
+data |>
+  tbl_summary(
+    include = c(SEMSA_TOT),
+    statistic = 
+      all_continuous() ~ "Percentile : {p33} {p66} {p99} ")
+p33 <- quantile(data$SEMSA_TOT, probs = 0.33, na.rm = TRUE)
+p66 <- quantile(data$SEMSA_TOT, probs = 0.66, na.rm = TRUE)
+
+#Creation of the HLQ categorical score variable: 2,3,4 becomes bad, average, good
+data <- data %>%
+  mutate(
+    SEMSA_ord = case_when(
+  SEMSA_TOT <= p33 ~  "1",
+  SEMSA_TOT > p33 & SEMSA_TOT <= p66 ~ "2",
+  SEMSA_TOT > p66  ~ "3")
+  )
+
+#Transform character in ordinal with 3 levels in the following order 1<2<3
+data$SEMSA_ord <- factor(data$SEMSA_ord,ordered = TRUE)
+
+#Verification of the distribution
+table(data$SEMSA_ord)
+```
+
+### Calculation of the ordinal regression of the HLQ score function of covariates to calculate the propensity score
+
+The score is calculated using ordinal logistic regression (the HLQ variable is transformed into an ordinal variable, resulting in scores of 2 -\> 1, 3 -\> 2, 4 -\> 3, etc.). It corresponds to the conditional probability (y) of exposure, weighted by the presence of covariates (x) (defined by DAG).
+
+Here, the chosen covariates are age, gender, and BMI, as examples.
+
+```{r}
+#Calculating PS using ordinal logistic regression
+ps_model <- MASS::polr(SEMSA_ord ~ AGE + GENDER + BODY.MASS.INDEX + APNEA.HYPOPNEA.INDEX,
+                data = data, Hess = TRUE)
+summary(ps_model)
+```
+
+#### Interpretation of regression results
+
+Odds ratios are calculated comparing the probability that Y ≥ B to the probability that Y ≤ A.
+
+Threshold between category 1 and 2 (1\|2): ; Threshold between category 2 and 3 (2\|3)
+
+We observe that increasing age increases the OR: exp(0.021) = 1.024, meaning that the older the individual, the higher the probability of having a better HLQ score.
+
+For gender, the OR = exp(-0.54) = 0.7, where 1 represents males, meaning men have a lower probability of having a low HLQ score.
+
+For BMI, the OR exp(0.014) = 1.017, meaning the probability of having a better HLQ score increases with weight.
+
+#### Slope test verification
+
+For ordinal regression, it is necessary to verify the proportionality of the odds ratios by testing the slopes to check if the coefficients are equal between the k thresholds.
+
+```{r}
+#Verification of the proportionality of the odds ratios by applying a slope test
+t <- brant::brant(ps_model)
+```
+
+Here all the tests are \> 0.05, so we do not reject H0 for any of the variables, which are all proportional. The transition between each threshold is constant (1-\>2-\>3).
+
+### Calculating the propensity score using equations
+
+We can therefore use our regression to calculate propensity scores (PS) from the regression equations, obtaining an equation of the form:
+
+log(P(Y≤k)/P(Y\>k)) = θk - β1\*AGE + β2\*GENDER + β3\*BMI
+
+where k represents two thresholds (Threshold 1 compares 1 vs. 2 and 3 / Threshold 2 compares 1 and 2 vs. 3). From this, we calculate the propensity score of each individual added to the database:
+
+PS = e\^logit / (1+e\^(logit))
+
+We calculate the probability of being in each category for each patient in order to estimate the entire distribution according to the chosen covariates.
+
+```{r}
+#Calculation of category probabilities: coefficients
+beta <- coef(ps_model)
+
+#Isolate the intercepts
+intercept <- ps_model$zeta
+
+#Isolate the coefficients of the covariates
+betaX <- beta["AGE"] * data$AGE + beta["GENDER"] * data$GENDER +
+        beta["BODY.MASS.INDEX"] * data$BODY.MASS.INDEX + beta["APNEA.HYPOPNEA.INDEX"] * data$APNEA.HYPOPNEA.INDEX
+
+#Cumulative probabilities
+p_mauvais_moyen <- 1/(1+exp(-(intercept["1|2"] - betaX)))
+
+p_moyen_bon <- 1/(1+exp(-(intercept["2|3"] - betaX)))
+
+#Probabilities per category: the sum of the scores = 1 for each individual
+data$ps_mauvais <- p_mauvais_moyen
+data$ps_moyen <- p_moyen_bon - p_mauvais_moyen
+data$ps_bon <- 1 - p_moyen_bon 
+
+summary(data$ps_mauvais)
+summary(data$ps_moyen)
+summary(data$ps_bon)
+
+#Isolate PS for each calculated individual
+data <- data %>%
+  mutate(
+    ps_ind = case_when(
+  SEMSA_ord == "1" ~ data$ps_mauvais,
+  SEMSA_ord == "2" ~ data$ps_moyen,
+  SEMSA_ord == "3" ~ data$ps_bon)
+  )
+head(table(data$ps_ind))
+
+#Visualization of PS according to the categories       
+data %>%
+  ggplot(aes(x = ps_ind, fill = SEMSA_ord)) +
+  geom_density(alpha = 0.5) +  scale_x_log10() +
+  scale_fill_manual(values= c("1"="purple","2"="yellow","3"="blue"))
+```
+
+### Calculating the propensity score using the predict function
+
+```{r}
+#Calculating the propensity score using predict = probability of being in each category for all individuals
+table_ps <- data.frame(predict(ps_model, data, type = "probs")) 
+head(table_ps)
+
+#Verification of PS distribution
+summary(table_ps)
+table_ps <- table_ps %>% rename("1" = "X1", "2" = "X2", "3" = "X3")
+
+#Add the PS to the database
+data <- cbind(data, table_ps)
+
+#Visualization of PS according to the categories 
+#Pivot columns to visualize the data
+data_graph <- data  %>% 
+  select("1", "2", "3") %>%
+  pivot_longer(cols = everything(), names_to = "Categories", values_to = "Score")
+head(as.data.frame(table(data_graph)))
+
+ggplot(data_graph, aes(x = Score, fill = Categories)) +
+  geom_density(alpha = 0.5) +  scale_x_log10() +
+  scale_fill_manual(values= c("1"="purple","2"="yellow","3"="blue"))
+```
+
+### Calculation of weighting IPTW
+
+The IPTW score is calculated from the propensity score and is its inverse.
+
+For an ordinal variable, the weight depends on the probability of the observed category; it corresponds to w_i = 1 / (P(T_i = t_i \| X_i) =\> 1/PS calculated previously.
+
+```{r}
+#Weight calculation = inverse of propensity score with individual weight. DO NOT ROUND.
+data <- data %>%
+  mutate(
+    iptw = case_when(
+  SEMSA_ord == "1" ~ 1/data$ps_ind,
+  SEMSA_ord == "2" ~ 1/data$ps_ind,
+  SEMSA_ord == "3" ~ 1/data$ps_ind)
+  )
+head(table(data$iptw))
+
+#Visualization of the balance of covariances after weighting
+graph <- bal.tab(SEMSA_ord ~ AGE + GENDER + BODY.MASS.INDEX + APNEA.HYPOPNEA.INDEX,
+                 weights = data$iptw,
+                 threshold = 0.1,
+                 data = data,
+                 un = TRUE)
+print(graph)
+love.plot(graph)
+```
+
+### Verification of the distribution of IPTW scores in the population
+
+```{r}
+#Verification of weight distribution
+summary(data$iptw)
+
+#Visualization 
+data %>%
+  ggplot(aes(x = iptw, fill = SEMSA_ord)) +
+  geom_density(alpha = 0.5) +  scale_x_log10() +
+  scale_fill_manual(values= c("1"="purple","2"="yellow","3"="blue"))
+```
+
+### Estimation of estimand
+
+Here, the estimand is the ATE due to the use of the IPTW. It answers the research question: what is the adjusted effect of the covariates (age, gender, BMI) on the probability of treatment adherence as a function of the SEMSA score.
+
+We use binomial regression to estimate treatment adherence (y = final outcome) as a function of the SEMSA score, based on the previously calculated weights.
+
+```{r}
+#Regression with the new weights using binary regression to determine if membership = yes/no
+fit <- glm(obs_J365_1M_PPC ~ SEMSA_ord, #effect of the HLQ score on binary variable adherence
+           data = data,
+           family = gaussian(), #corresponding to Y type
+           weights = iptw)
+
+summary(fit)
+```
+
+Here we obtain two p-values, one for the linear effect "L" and one for the quadratic effect "Q" because the SEMSA_ord variable is ordered: 1 \< 2 \< 3.
+
+The p-value is \< 0.05 for the linear effect, which shows that the model is statistically significant for a linear tendancy treatment adherence based on the ordinal SEMSA score.
+
+The p-value is \> 0.05 for the quadratic effect, which shows that the model is not statistically significant for predicting treatment adherence based on the ordinal SEMSA score.

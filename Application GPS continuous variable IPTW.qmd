@@ -1,0 +1,269 @@
+---
+title: "Code PS IPTW continuous variable"
+author: "Jeanne LECLERE"
+date: today 
+format: html
+editor: visual
+warning: FALSE
+message: FALSE
+---
+
+### Packages used
+
+```{r}
+library("dplyr")
+library("tidyverse")
+library("gtsummary")
+library("cobalt")
+library('ggplot2')
+```
+
+## Data formatting and creation of a continuous variable
+
+```{r}
+#Opening file
+data <- read.csv("donnees_synthetiques.csv", header = TRUE, sep=",")
+
+table_sum <- 
+  tbl_summary(
+    data,
+    include = c("BODY.MASS.INDEX", "GENDER", "AGE", "SEMSA_TOT", "APNEA.HYPOPNEA.INDEX"),
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    missing = "always",
+    digits = all_continuous() ~ 2
+  ) |>
+  modify_header(
+    label = "**Variable**"
+  )
+print(table_sum)
+
+#Visualization of SEMSA score
+data_1 <- data
+summary(data_1$SEMSA_TOT)
+data_1 %>%
+  ggplot(aes(x = SEMSA_TOT)) + 
+  geom_density(fill = "lavender",alpha = 0.5) +  
+  labs(title = "Distribution of SEMSA score") +
+  theme_minimal() 
+```
+
+### Calculation of the regression of the SEMSA score as a function of covariates to calculate the propensity score
+
+The score is calculated using linear regression. It corresponds to the conditional probability (y) of exposure, weighted by the presence of covariates (x) (defined by DAG).
+
+Here, the chosen covariates are age, gender, and BMI, as examples.
+
+```{r}
+#Estimating continuous exposure with linear regression
+ps_model <- lm(SEMSA_TOT ~ GENDER + AGE + BODY.MASS.INDEX + APNEA.HYPOPNEA.INDEX,
+                data = data_1)
+coefs <- coef(ps_model)
+print(coefs)
+summary(ps_model)
+```
+
+Here we have a linear regression, so we don't interpret the results using odds ratios (ORs) but only the p-values.
+
+We observe that increasing age increases the probability of having a better HLQ score (p-value \< 0.05 (0.0038)).
+
+Regarding gender, men have, on average, a lower SEMSAscore than women (p-value of 0.09 \> 0.05).
+
+For BMI, the effect is not significant (p-value \> 0.05).
+
+### Verification of the normality of distribution
+
+The propensity score becomes a continuous density function characterized by a mean and a variance. It has three properties: the total area is 1, so it should be 0; the probability corresponds to the area, not the height.
+
+It is necessary to calculate the regression residuals, which correspond to the difference between the observed and estimated values, and to verify their normality using a Shapiro-Mitsubishi test (check the conditions for use).
+
+```{r}
+#Visaul checking of normal distribution 
+qqnorm(residuals(ps_model))
+qqline(residuals(ps_model))
+```
+
+### Estimating the conditional exposure
+
+```{r}
+#Estimating the parameters (mean, variance) of normaal distribution 
+score <- predict(ps_model) 
+sigma <-sd(residuals(ps_model))
+
+#Estimation of conditional density of GPS
+data_1$gps <-dnorm(data_1$SEMSA_TOT, mean=score, sd=sigma) 
+summary(data_1$gps) 
+
+#Visualization
+data_1 %>%
+  ggplot(aes(x = gps)) + 
+  geom_density(fill = "lavender",alpha = 0.5) +  
+  labs(title = "Distribution of GPS") +
+  theme_minimal() 
+```
+
+### Reprensentation of a patient's gps (density) with his SEMSA score observed
+
+```{r}
+#Patient i
+i <- 5
+
+#Creation 
+#Predicted value
+mean <- score[i] 
+sigma
+
+#Observed value
+T_i <- data_1$SEMSA_TOT[i] 
+
+#Grid of T values with 100 points on the curve
+t_vals <- seq(min(data_1$SEMSA_TOT),
+              max(data_1$SEMSA_TOT),
+              length.out = 100) 
+
+#Conditional density
+dens <- dnorm(t_vals, mean = mean, sd = sigma)
+df_plot <- data.frame(t = t_vals, dens = dens)
+
+#GPS : Conditionnal density of the value
+gps_i <- dnorm(T_i, mean = mean, sd = sigma)
+
+ggplot(df_plot, aes(x = t, y = dens)) +
+  geom_line(color = "blue", linewidth = 1) +
+  geom_vline(xintercept = T_i, color = "black") +
+  annotate("point",x = T_i,y = gps_i, color = "red", size = 3) +
+  theme_minimal() +
+  labs(title = paste("Conditionnal density of patient", i),
+       x = "SEMSA_tot",
+       y = "Density")
+```
+
+### Caculation of IPTW weight
+
+The IPTW score is calculated from the propensity score and is the inverse of the propensity score for each individual.
+
+For a continuous variable, the weight depends on the observed conditional density function and is calculated as follows:
+
+w_i = 1 / f(T_i \| X_i) =\> 1/GPS calculated previously.
+
+```{r}
+#Calculation of marginal density 
+d_marg <- dnorm(data_1$SEMSA_TOT, mean = mean(data_1$SEMSA_TOT), sd = sd(data_1$SEMSA_TOT))
+
+#Calculation stabilized weights
+data_1$iptw <- d_marg/data_1$gps
+
+#Visualization
+data_1 %>%
+  ggplot(aes(x = iptw)) + scale_x_log10() +
+  geom_density(fill = "lavender",alpha = 0.5) +  
+  labs(title = "Distribution of weights (log scale)") +
+  theme_minimal() 
+```
+
+#### Trimming extreme weights
+
+```{r}
+#Trimming extreme weights through 5e and 95e quantiles
+data_1$iptw_trim <- pmin(pmax(data_1$iptw, quantile(data_1$iptw, 0.05)), quantile(data_1$iptw, 0.95))
+
+#Visualisation
+data_1 %>%
+  ggplot(aes(x = iptw_trim)) + scale_x_log10() +
+  geom_density(fill = "lavender",alpha = 0.5) +  
+  labs(title = "Distribution of trimmed weights (log scale)") +
+  theme_minimal() 
+
+#nombre de patient
+data_1 <- data_1 %>%
+  mutate(
+    nb_patient_trim = case_when(
+  iptw == iptw_trim ~ 0,
+  iptw != iptw_trim ~ 1)
+  )
+sum(data_1$nb_patient_trim)
+```
+
+```         
+```
+
+### Verification of GPS distribution through exposition strata
+
+```{r}
+#creating quintiles of exposition 
+data_1$SEMSA_q <- ntile(data_1$SEMSA_TOT, 5)
+
+#Visualisation
+data_1 %>%
+  ggplot(aes(x = gps, fill = as.factor(SEMSA_q))) +
+  geom_density(binwidth = 2,
+                 position = "identity",
+                 alpha = 0.5) +
+  scale_fill_manual(values = c("purple", "yellow", "orange", "blue", "green")) +
+  labs(x = "Quintiles of exposition", y = "Density of Gneralized Propensity Score", fill = "Quintiles of GPS") +  theme_classic()
+```
+
+#### Verification of the covariate balance after using the weights
+
+```{r}
+#Visualization
+graph <- bal.tab(SEMSA_TOT ~ GENDER + BODY.MASS.INDEX + AGE + APNEA.HYPOPNEA.INDEX,
+                 weights = data_1$iptw_trim,
+                 data = data_1,
+                 threshold = 0.1,
+                 abs = TRUE,
+                 un = TRUE)
+print(graph)
+love.plot(graph)
+#to save :ggsave("distribution_GPS.png",plot = last_plot(),width = 6,height = 4,dpi = 300)
+```
+
+### Estimation of the estimand
+
+Here, the estimand is the ATE due to the use of the IPTW. It answers the research question: what is the adjusted effect of the covariates (age, gender, BMI) on the treatment adherence function of the SEMSA score.
+
+We use binomial regression to estimate treatment adherence (y = final outcome) function of the SEMSA score, based on the previously calculated weights.
+
+#### Linear outcome
+
+```{r}
+#Linear regression with new weights to calculate estimand
+fit <- glm(obs_J90_1M_PPC ~ SEMSA_TOT,
+           data = data_1,
+           family = gaussian(),
+           weights = iptw_trim) 
+
+summary(fit)
+```
+
+A 1-unit increase in the SEMSA score is associated with a 68-unit increase in PPC.
+
+The p-value is \< 0.05, which shows that the model is statistically significant in predicting treatment adherence based on the total SEMSA score.
+
+#### Binomial outcome
+
+```{r}
+#Logistic regression with new weights to calculate estimand
+fit <- glm(obs_J365_periode ~ SEMSA_TOT,
+           data = data_1,
+           family = binomial(), 
+           weights = iptw) 
+
+summary(fit)
+```
+
+A 1-unit increase in the SEMSA score is associated with an e\^1.16 increase in the likelihood of experiencing event 1 in obs_J365_periode.
+
+The p-value is \< 0.05, indicating that the model is statistically significant in predicting treatment adherence based on the total SEMSA score.
+
+```{r}
+ggplot(data_1, aes(x = SEMSA_TOT, y = obs_J90_1M_PPC)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(aes(weight = iptw), method = "loess", se = TRUE, color = "red") +
+  #True = Ic 95% de la courbe rouge
+  theme_minimal() +
+  labs(x = "SEMSA score",
+       y = "Prediction of adherence")
+```
